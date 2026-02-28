@@ -56,7 +56,7 @@ func (v Value) Round(r int, mode RoundingMode) Value {
 }
 
 func (v Value) Value() (driver.Value, error) {
-	return v.Float64(), nil
+	return v.FormatString(DefaultPrecision), nil
 }
 
 func (v *Value) Scan(src interface{}) error {

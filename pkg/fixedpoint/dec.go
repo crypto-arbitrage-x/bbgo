@@ -110,7 +110,7 @@ var halfpow10 = [...]uint64{
 
 
 func (v Value) Value() (driver.Value, error) {
-	return v.Float64(), nil
+	return v.FormatString(8), nil
 }
 
 // NewFromInt returns a Value for an int
