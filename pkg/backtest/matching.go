@@ -69,6 +69,10 @@ type SimplePriceMatching struct {
 
 	account *types.Account
 
+	// Futures mode fields
+	isFutures       bool
+	futuresPosition *FuturesPositionTracker
+
 	tradeUpdateCallbacks   []func(trade types.Trade)
 	orderUpdateCallbacks   []func(order types.Order)
 	balanceUpdateCallbacks []func(balances types.BalanceMap)
@@ -110,15 +114,23 @@ func (m *SimplePriceMatching) CancelOrder(o types.Order) (types.Order, error) {
 		return o, fmt.Errorf("cancel order failed, order %d not found: %+v", o.OrderID, o)
 	}
 
-	switch o.Side {
-	case types.SideTypeBuy:
-		if err := m.account.UnlockBalance(m.Market.QuoteCurrency, o.Price.Mul(o.Quantity)); err != nil {
+	if m.isFutures {
+		// In futures mode, both buy and sell orders lock Quote (margin)
+		margin := o.Price.Mul(o.Quantity).Div(m.futuresPosition.Leverage)
+		if err := m.account.UnlockBalance(m.Market.QuoteCurrency, margin); err != nil {
 			return o, err
 		}
+	} else {
+		switch o.Side {
+		case types.SideTypeBuy:
+			if err := m.account.UnlockBalance(m.Market.QuoteCurrency, o.Price.Mul(o.Quantity)); err != nil {
+				return o, err
+			}
 
-	case types.SideTypeSell:
-		if err := m.account.UnlockBalance(m.Market.BaseCurrency, o.Quantity); err != nil {
-			return o, err
+		case types.SideTypeSell:
+			if err := m.account.UnlockBalance(m.Market.BaseCurrency, o.Quantity); err != nil {
+				return o, err
+			}
 		}
 	}
 
@@ -166,15 +178,21 @@ func (m *SimplePriceMatching) PlaceOrder(o types.SubmitOrder) (*types.Order, *ty
 		return nil, nil, fmt.Errorf("order amount %s is less than minNotional %s, order: %+v", quoteQuantity.String(), m.Market.MinNotional.String(), o)
 	}
 
-	switch o.Side {
-	case types.SideTypeBuy:
-		if err := m.account.LockBalance(m.Market.QuoteCurrency, quoteQuantity); err != nil {
+	if m.isFutures {
+		if err := m.lockFuturesMargin(o, price); err != nil {
 			return nil, nil, err
 		}
+	} else {
+		switch o.Side {
+		case types.SideTypeBuy:
+			if err := m.account.LockBalance(m.Market.QuoteCurrency, quoteQuantity); err != nil {
+				return nil, nil, err
+			}
 
-	case types.SideTypeSell:
-		if err := m.account.LockBalance(m.Market.BaseCurrency, o.Quantity); err != nil {
-			return nil, nil, err
+		case types.SideTypeSell:
+			if err := m.account.LockBalance(m.Market.BaseCurrency, o.Quantity); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 
@@ -220,25 +238,48 @@ func (m *SimplePriceMatching) PlaceOrder(o types.SubmitOrder) (*types.Order, *ty
 				return nil, nil, fmt.Errorf("the average price of the given limit taker order can not be zero")
 			}
 
-			switch o.Side {
-			case types.SideTypeBuy:
-				// limit buy taker, the order price is higher than the current best ask price
-				// the executed price is lower than the given price, so we will use less quote currency to buy the base asset.
-				amount := order.Price.Sub(order.AveragePrice).Mul(order.Quantity)
-				if amount.Sign() > 0 {
-					if err := m.account.UnlockBalance(m.Market.QuoteCurrency, amount); err != nil {
-						return nil, nil, err
+			if m.isFutures {
+				// For ReduceOnly orders, no margin was locked — skip the unlock-diff logic.
+				if !o.ReduceOnly {
+					// In futures mode, the price difference affects the margin amount
+					// We locked margin based on order.Price, but executed at order.AveragePrice
+					priceDiff := order.Price.Sub(order.AveragePrice)
+					if o.Side == types.SideTypeSell {
+						priceDiff = order.AveragePrice.Sub(order.Price)
 					}
-					m.EmitBalanceUpdate(m.account.Balances())
+					if priceDiff.Sign() > 0 {
+						marginDiff := priceDiff.Mul(order.Quantity).Div(m.futuresPosition.Leverage)
+						if o.Side == types.SideTypeBuy {
+							if err := m.account.UnlockBalance(m.Market.QuoteCurrency, marginDiff); err != nil {
+								return nil, nil, err
+							}
+						} else {
+							m.account.AddBalance(m.Market.QuoteCurrency, marginDiff)
+						}
+						m.EmitBalanceUpdate(m.account.Balances())
+					}
 				}
+			} else {
+				switch o.Side {
+				case types.SideTypeBuy:
+					// limit buy taker, the order price is higher than the current best ask price
+					// the executed price is lower than the given price, so we will use less quote currency to buy the base asset.
+					amount := order.Price.Sub(order.AveragePrice).Mul(order.Quantity)
+					if amount.Sign() > 0 {
+						if err := m.account.UnlockBalance(m.Market.QuoteCurrency, amount); err != nil {
+							return nil, nil, err
+						}
+						m.EmitBalanceUpdate(m.account.Balances())
+					}
 
-			case types.SideTypeSell:
-				// limit sell taker, the order price is lower than the current best bid price
-				// the executed price is higher than the given price, so we will get more quote currency back
-				amount := order.AveragePrice.Sub(order.Price).Mul(order.Quantity)
-				if amount.Sign() > 0 {
-					m.account.AddBalance(m.Market.QuoteCurrency, amount)
-					m.EmitBalanceUpdate(m.account.Balances())
+				case types.SideTypeSell:
+					// limit sell taker, the order price is lower than the current best bid price
+					// the executed price is higher than the given price, so we will get more quote currency back
+					amount := order.AveragePrice.Sub(order.Price).Mul(order.Quantity)
+					if amount.Sign() > 0 {
+						m.account.AddBalance(m.Market.QuoteCurrency, amount)
+						m.EmitBalanceUpdate(m.account.Balances())
+					}
 				}
 			}
 		}
@@ -273,6 +314,11 @@ func (m *SimplePriceMatching) PlaceOrder(o types.SubmitOrder) (*types.Order, *ty
 }
 
 func (m *SimplePriceMatching) executeTrade(trade types.Trade) {
+	if m.isFutures {
+		m.executeFuturesTrade(trade)
+		return
+	}
+
 	var err error
 	// execute trade, update account balances
 	if trade.IsBuyer {
@@ -354,6 +400,7 @@ func (m *SimplePriceMatching) newTradeFromOrder(order *types.Order, isMaker bool
 		Time:          types.Time(m.currentTime),
 		Fee:           fee,
 		FeeCurrency:   feeCurrency,
+		IsFutures:     m.isFutures,
 	}
 }
 
@@ -682,6 +729,12 @@ func (m *SimplePriceMatching) processKLine(kline types.KLine) {
 		}
 	}
 
+	// Futures: check liquidation and apply funding fee after order matching
+	if m.isFutures {
+		m.checkFuturesLiquidation(kline)
+		m.applyFundingFee(kline)
+	}
+
 	m.lastKLine = kline
 }
 
@@ -721,4 +774,257 @@ func isLimitTakerOrder(o types.SubmitOrder, currentPrice fixedpoint.Value) bool 
 
 	return o.Type == types.OrderTypeLimit && ((o.Side == types.SideTypeBuy && o.Price.Compare(currentPrice) >= 0) ||
 		(o.Side == types.SideTypeSell && o.Price.Compare(currentPrice) <= 0))
+}
+
+// lockFuturesMargin locks the required margin for a futures order.
+// In futures mode, both buy and sell orders lock Quote currency as margin.
+// For reduce-only or position-reducing orders, no additional margin is needed.
+func (m *SimplePriceMatching) lockFuturesMargin(o types.SubmitOrder, price fixedpoint.Value) error {
+	pos := m.futuresPosition
+	side := string(o.Side)
+
+	// ReduceOnly: validate and skip margin lock
+	if o.ReduceOnly {
+		if !pos.IsReducingPosition(side, o.Quantity) {
+			return fmt.Errorf("reduce-only order rejected: side %s qty %s would not reduce position (base=%s)",
+				o.Side, o.Quantity.String(), pos.Base.String())
+		}
+		return nil
+	}
+
+	// Determine how much of this order is opening new position vs closing existing
+	var openQty fixedpoint.Value
+	if pos.Base.IsZero() {
+		openQty = o.Quantity
+	} else if pos.IsReducingPosition(side, o.Quantity) {
+		// Fully reducing — no margin needed
+		return nil
+	} else {
+		// Partially reducing then reversing, or adding to position
+		absBase := pos.Base.Abs()
+		isSameDirection := (pos.Base.Sign() > 0 && side == "BUY") || (pos.Base.Sign() < 0 && side == "SELL")
+		if isSameDirection {
+			openQty = o.Quantity // adding to same direction
+		} else if o.Quantity.Compare(absBase) > 0 {
+			openQty = o.Quantity.Sub(absBase) // reversing: only the excess needs margin
+		} else {
+			return nil // reducing
+		}
+	}
+
+	notional := openQty.Mul(price)
+	margin := notional.Div(pos.Leverage)
+	return m.account.LockBalance(m.Market.QuoteCurrency, margin)
+}
+
+// executeFuturesTrade processes a trade in futures mode.
+// It updates the position tracker and settles realized PnL.
+func (m *SimplePriceMatching) executeFuturesTrade(trade types.Trade) {
+	pos := m.futuresPosition
+	side := string(trade.Side)
+
+	realizedPnL, marginDelta, err := pos.ProcessTrade(side, trade.Quantity, trade.Price)
+	if err != nil {
+		panic(fmt.Errorf("executeFuturesTrade: %w", err))
+	}
+
+	quoteCurrency := m.Market.QuoteCurrency
+
+	// Handle margin changes
+	if marginDelta.Sign() > 0 {
+		// Margin released (position reduced/closed)
+		// Use locked balance then add the released margin back to available
+		if err := m.account.UseLockedBalance(quoteCurrency, marginDelta); err != nil {
+			// If UseLockedBalance fails, the margin was already consumed by lockFuturesMargin flow.
+			// For reduce-only orders, no margin was locked, so we directly add.
+			m.account.AddBalance(quoteCurrency, marginDelta)
+		} else {
+			m.account.AddBalance(quoteCurrency, marginDelta)
+		}
+	} else if marginDelta.Sign() < 0 {
+		// Margin consumed (position opened/added)
+		absMargin := marginDelta.Neg()
+		if err := m.account.UseLockedBalance(quoteCurrency, absMargin); err != nil {
+			// Fallback: if locked balance is insufficient (e.g. due to ReduceOnly order
+			// that skipped margin locking, or rounding), deduct directly from available balance.
+			klineMatchingLogger.Warnf("executeFuturesTrade: UseLockedBalance failed (%v), deducting from available", err)
+			m.account.AddBalance(quoteCurrency, marginDelta) // marginDelta is negative
+		}
+	}
+
+	// Settle realized PnL into wallet balance
+	if !realizedPnL.IsZero() {
+		m.account.AddBalance(quoteCurrency, realizedPnL)
+		klineMatchingLogger.Debugf("futures realized PnL: %s %s (position: %s)",
+			realizedPnL.String(), quoteCurrency, pos.String())
+	}
+
+	// Deduct trading fee from quote balance.
+	// In futures mode, all fees are settled in quote currency (USDT) regardless of
+	// the feeModeFunction's feeCurrency output, because futures contracts don't
+	// involve actual base asset transfers.
+	if trade.FeeCurrency == quoteCurrency {
+		m.account.AddBalance(quoteCurrency, trade.Fee.Neg())
+	} else if trade.FeeCurrency != FeeToken {
+		// feeMode=native charges base currency on buy side, but for futures
+		// the fee is always deducted from quote (USDT). Convert and deduct.
+		quoteEquivFee := trade.Fee.Mul(trade.Price)
+		m.account.AddBalance(quoteCurrency, quoteEquivFee.Neg())
+	}
+	// For FeeToken mode, fee is not deducted from balances
+
+	m.EmitTradeUpdate(trade)
+	m.EmitBalanceUpdate(m.account.Balances())
+}
+
+// checkFuturesLiquidation checks if the position should be liquidated at the kline's extreme price.
+func (m *SimplePriceMatching) checkFuturesLiquidation(kline types.KLine) {
+	pos := m.futuresPosition
+	if pos.Base.IsZero() {
+		return
+	}
+
+	// For long positions, check at the low price; for short positions, check at the high price
+	var worstPrice fixedpoint.Value
+	if pos.Base.Sign() > 0 {
+		worstPrice = kline.Low
+	} else {
+		worstPrice = kline.High
+	}
+
+	walletBalance := m.getWalletBalance()
+	if !pos.IsLiquidated(walletBalance, worstPrice) {
+		return
+	}
+
+	klineMatchingLogger.Infof("LIQUIDATION triggered at price %s for position %s (wallet balance: %s)",
+		worstPrice.String(), pos.String(), walletBalance.String())
+
+	// Save position info before force close
+	liqQuantity := pos.Base.Abs()
+	var liqSide types.SideType
+	if pos.Base.Sign() > 0 {
+		liqSide = types.SideTypeSell // close long
+	} else {
+		liqSide = types.SideTypeBuy // close short
+	}
+
+	// Force close the position
+	realizedPnL := pos.ForceClose(worstPrice)
+
+	// Cancel all open orders for this symbol
+	m.cancelAllOrders()
+
+	// Settle the liquidation PnL
+	m.account.AddBalance(m.Market.QuoteCurrency, realizedPnL)
+
+	// Emit a liquidation trade
+	tradeID := incTradeID()
+	liqTrade := types.Trade{
+		ID:            tradeID,
+		Exchange:      types.ExchangeBacktest,
+		Price:         worstPrice,
+		Quantity:      liqQuantity,
+		QuoteQuantity: liqQuantity.Mul(worstPrice),
+		Symbol:        m.Market.Symbol,
+		Side:          liqSide,
+		IsBuyer:       liqSide == types.SideTypeBuy,
+		Time:          types.Time(m.currentTime),
+		Fee:           fixedpoint.Zero,
+		FeeCurrency:   m.Market.QuoteCurrency,
+		IsFutures:     true,
+	}
+	m.EmitTradeUpdate(liqTrade)
+	m.EmitBalanceUpdate(m.account.Balances())
+}
+
+// applyFundingFee applies funding fee when the kline crosses a funding time boundary.
+// Funding times: UTC 00:00, 08:00, 16:00.
+func (m *SimplePriceMatching) applyFundingFee(kline types.KLine) {
+	pos := m.futuresPosition
+	if pos.Base.IsZero() {
+		return
+	}
+
+	klineStart := kline.StartTime.Time()
+	klineEnd := kline.EndTime.Time()
+
+	// Initialize LastFundingTime if not set
+	if pos.LastFundingTime.IsZero() {
+		pos.LastFundingTime = prevFundingTime(klineStart)
+	}
+
+	// Check each funding time between lastFundingTime and klineEnd
+	nextFunding := nextFundingTime(pos.LastFundingTime)
+	for !nextFunding.After(klineEnd) {
+		if nextFunding.After(klineStart) || nextFunding.Equal(klineStart) {
+			// Apply funding fee
+			fee := pos.CalculateFundingFee(m.lastPrice)
+			if !fee.IsZero() {
+				m.account.AddBalance(m.Market.QuoteCurrency, fee.Neg())
+				klineMatchingLogger.Debugf("funding fee applied: %s %s at %s",
+					fee.String(), m.Market.QuoteCurrency, nextFunding.String())
+			}
+		}
+		pos.LastFundingTime = nextFunding
+		nextFunding = nextFundingTime(nextFunding)
+	}
+}
+
+// cancelAllOrders cancels all open bid and ask orders (used during liquidation).
+func (m *SimplePriceMatching) cancelAllOrders() {
+	for _, o := range m.bidOrders {
+		o.Status = types.OrderStatusCanceled
+		m.EmitOrderUpdate(o)
+	}
+	for _, o := range m.askOrders {
+		o.Status = types.OrderStatusCanceled
+		m.EmitOrderUpdate(o)
+	}
+	m.bidOrders = nil
+	m.askOrders = nil
+}
+
+// getWalletBalance returns the available + locked balance for the quote currency.
+func (m *SimplePriceMatching) getWalletBalance() fixedpoint.Value {
+	bal, ok := m.account.Balance(m.Market.QuoteCurrency)
+	if !ok {
+		return fixedpoint.Zero
+	}
+	return bal.Available.Add(bal.Locked)
+}
+
+// nextFundingTime returns the next funding time (UTC 00:00, 08:00, 16:00) after t.
+func nextFundingTime(t time.Time) time.Time {
+	utc := t.UTC()
+	hour := utc.Hour()
+	y, mo, d := utc.Date()
+
+	var nextHour int
+	switch {
+	case hour < 8:
+		nextHour = 8
+	case hour < 16:
+		nextHour = 16
+	default:
+		// next day 00:00
+		return time.Date(y, mo, d+1, 0, 0, 0, 0, time.UTC)
+	}
+	return time.Date(y, mo, d, nextHour, 0, 0, 0, time.UTC)
+}
+
+// prevFundingTime returns the most recent funding time (UTC 00:00, 08:00, 16:00) at or before t.
+func prevFundingTime(t time.Time) time.Time {
+	utc := t.UTC()
+	hour := utc.Hour()
+	y, mo, d := utc.Date()
+
+	switch {
+	case hour >= 16:
+		return time.Date(y, mo, d, 16, 0, 0, 0, time.UTC)
+	case hour >= 8:
+		return time.Date(y, mo, d, 8, 0, 0, 0, time.UTC)
+	default:
+		return time.Date(y, mo, d, 0, 0, 0, 0, time.UTC)
+	}
 }

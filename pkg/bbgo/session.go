@@ -337,8 +337,10 @@ func (session *ExchangeSession) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("unmarshal exchange session config: %w", err)
 	}
 
-	// then unmarshal the rest of the fields
-	if err := json.Unmarshal(data, session); err != nil {
+	// Use a type alias to avoid infinite recursion:
+	// json.Unmarshal on *ExchangeSession would call this UnmarshalJSON again.
+	type exchangeSessionAlias ExchangeSession
+	if err := json.Unmarshal(data, (*exchangeSessionAlias)(session)); err != nil {
 		return fmt.Errorf("unmarshal exchange session: %w", err)
 	}
 

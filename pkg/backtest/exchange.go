@@ -90,10 +90,15 @@ func NewExchange(
 	startTime := config.StartTime.Time()
 	configAccount := config.GetAccount(sourceName.String())
 
+	accountType := types.AccountTypeSpot
+	if configAccount.Futures {
+		accountType = types.AccountTypeFutures
+	}
+
 	account := &types.Account{
 		MakerFeeRate: configAccount.MakerFeeRate,
 		TakerFeeRate: configAccount.TakerFeeRate,
-		AccountType:  types.AccountTypeSpot,
+		AccountType:  accountType,
 	}
 
 	balances := configAccount.Balances.BalanceMap()
@@ -137,12 +142,24 @@ func (e *Exchange) resetMatchingBooks() {
 }
 
 func (e *Exchange) _addMatchingBook(symbol string, market types.Market) {
+	configAccount := e.config.GetAccount(e.sourceName.String())
+
 	matching := &SimplePriceMatching{
 		currentTime:     e.currentTime,
 		account:         e.account,
 		Market:          market,
 		closedOrders:    make(map[uint64]types.Order),
 		feeModeFunction: getFeeModeFunction(e.config.FeeMode),
+	}
+
+	if configAccount.Futures {
+		matching.isFutures = true
+		matching.futuresPosition = NewFuturesPositionTracker(
+			symbol,
+			configAccount.Leverage,
+			configAccount.MaintenanceMarginRate,
+			configAccount.FundingRate,
+		)
 	}
 
 	e.matchingBooks[symbol] = matching

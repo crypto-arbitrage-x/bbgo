@@ -20,15 +20,23 @@ import (
 func (e *Exchange) queryFuturesClosedOrders(
 	ctx context.Context, symbol string, since, until time.Time, lastOrderID uint64,
 ) (orders []types.Order, err error) {
+	// Binance Futures API restricts closed order queries to the most recent 90 days.
+	// Clamp the since time to avoid API error code -4166.
+	earliest := time.Now().Add(-89 * 24 * time.Hour)
+	if since.Before(earliest) {
+		log.Warnf("adjusting futures closed orders query start time from %s to %s (90-day limit)", since, earliest)
+		since = earliest
+	}
+
 	// Query regular orders
 	req := e.futuresClient.NewListOrdersService().Symbol(symbol)
 
 	if lastOrderID > 0 {
 		req.OrderID(int64(lastOrderID))
 	} else {
-		req.StartTime(since.UnixMilli() / int64(time.Millisecond))
+		req.StartTime(since.UnixNano() / int64(time.Millisecond))
 		if until.Sub(since) < 24*time.Hour {
-			req.EndTime(until.UnixMilli() / int64(time.Millisecond))
+			req.EndTime(until.UnixNano() / int64(time.Millisecond))
 		}
 	}
 
@@ -46,9 +54,9 @@ func (e *Exchange) queryFuturesClosedOrders(
 	// Query algo orders
 	reqAlgo := e.futuresClient.NewListAllAlgoOrdersService().Symbol(symbol)
 	if lastOrderID == 0 {
-		reqAlgo.StartTime(since.UnixMilli() / int64(time.Millisecond))
+		reqAlgo.StartTime(since.UnixNano() / int64(time.Millisecond))
 		if until.Sub(since) < 24*time.Hour {
-			reqAlgo.EndTime(until.UnixMilli() / int64(time.Millisecond))
+			reqAlgo.EndTime(until.UnixNano() / int64(time.Millisecond))
 		}
 	} else {
 		// For algo orders, we can use AlgoID to filter

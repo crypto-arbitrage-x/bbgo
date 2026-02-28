@@ -470,7 +470,12 @@ func (e *GeneralOrderExecutor) ClosePosition(ctx context.Context, percentage fix
 	}
 
 	if e.session.Futures { // Futures: Use base qty in e.position
-		submitOrder.Quantity = e.position.GetBase().Abs()
+		quantity := e.position.GetBase().Abs()
+		if percentage.Compare(fixedpoint.One) < 0 {
+			quantity = quantity.Mul(percentage)
+		}
+		quantity = e.position.Market.TruncateQuantity(quantity)
+		submitOrder.Quantity = quantity
 		submitOrder.ReduceOnly = true
 
 		if e.position.IsLong() {

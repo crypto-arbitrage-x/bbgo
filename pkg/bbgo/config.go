@@ -175,6 +175,18 @@ type BacktestAccount struct {
 	TakerFeeRate fixedpoint.Value `json:"takerFeeRate,omitempty" yaml:"takerFeeRate,omitempty"`
 
 	Balances BacktestAccountBalanceMap `json:"balances" yaml:"balances"`
+
+	// Futures enables futures/perpetual contract mode for backtesting.
+	Futures bool `json:"futures,omitempty" yaml:"futures,omitempty"`
+
+	// Leverage sets the leverage multiplier for futures mode (default: 1).
+	Leverage fixedpoint.Value `json:"leverage,omitempty" yaml:"leverage,omitempty"`
+
+	// MaintenanceMarginRate for futures liquidation check (default: 0.4%).
+	MaintenanceMarginRate fixedpoint.Value `json:"maintenanceMarginRate,omitempty" yaml:"maintenanceMarginRate,omitempty"`
+
+	// FundingRate per 8 hours for futures mode (default: 0.01%).
+	FundingRate fixedpoint.Value `json:"fundingRate,omitempty" yaml:"fundingRate,omitempty"`
 }
 
 var DefaultBacktestAccount = BacktestAccount{
